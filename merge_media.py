@@ -61,7 +61,17 @@ def validate_inputs(files):
         raise ValueError("❌ All input files must have the same format")
     return exts[0]
 
-
+def has_audio_stream(file):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        file
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout.strip() != ""
 # ----------------------------
 # PREPROCESS (VIDEO ONLY SAFE)
 # ----------------------------
@@ -149,36 +159,56 @@ def merge_video(temp_files, output):
 
     n = len(temp_files)
 
+    # detect if ANY file has audio
+    has_audio = any(has_audio_stream(f) for f in temp_files)
+
     filter_parts = []
+
     for i in range(n):
         filter_parts.append(
             f"[{i}:v]setpts=PTS-STARTPTS[v{i}]"
         )
-        filter_parts.append(
-            f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]"
+
+        if has_audio:
+            filter_parts.append(
+                f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]"
+            )
+
+    if has_audio:
+        concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n)])
+        filter_complex = (
+            ";".join(filter_parts) +
+            f";{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
         )
 
-    concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n)])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output
+        ])
+    else:
+        # 🔥 VIDEO ONLY CASE
+        concat_inputs = "".join([f"[v{i}]" for i in range(n)])
+        filter_complex = (
+            ";".join(filter_parts) +
+            f";{concat_inputs}concat=n={n}:v=1:a=0[outv]"
+        )
 
-    filter_complex = (
-        ";".join(filter_parts) +
-        f";{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
-    )
-
-    cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[outv]",
-        "-map", "[outa]",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output
-    ])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-movflags", "+faststart",
+            output
+        ])
 
     subprocess.run(cmd, check=True)
-
-
 # ----------------------------
 # MAIN MERGE
 # ----------------------------
