@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import os
+import csv
 """
 -> A general-purpose concat CLI.
     -> variable number of inputs
@@ -14,12 +15,15 @@ import os
 -> If start time for a file is specified, its end time must also be specified
 
 Sample usage:
+
 python merge_media.py \
 a.mp3 0 27.4 \
 b.mp3 \
 c.mp3 5 15 \
 output.mp3
 
+
+python merge_media.py --csv C:/path/input.csv output.mp3
 
 
 """
@@ -35,47 +39,48 @@ def validate_inputs(files):
     exts = [get_ext(f["path"]) for f in files]
     if len(set(exts)) != 1:
         raise ValueError("❌ All input files must have the same format")
-
     return exts[0]
 
 
 def build_filter(files, is_video):
-    filter_parts = []
+    parts = []
 
+    # AUDIO filters
     for i, f in enumerate(files):
-        label = f"a{i}"
-
         if f["start"] is not None:
-            part = f"[{i}:a]atrim={f['start']}:{f['end']},asetpts=PTS-STARTPTS[{label}]"
+            parts.append(
+                f"[{i}:a]atrim={f['start']}:{f['end']},asetpts=PTS-STARTPTS[a{i}]"
+            )
         else:
-            part = f"[{i}:a]aresample=async=1:first_pts=0[{label}]"
+            parts.append(
+                f"[{i}:a]aresample=async=1:first_pts=0[a{i}]"
+            )
 
-        filter_parts.append(part)
-
-    concat_inputs = "".join([f"[a{i}]" for i in range(len(files))])
-
+    # VIDEO filters (if needed)
     if is_video:
-        # handle both video + audio
-        v_parts = []
         for i, f in enumerate(files):
             if f["start"] is not None:
-                v_parts.append(f"[{i}:v]trim={f['start']}:{f['end']},setpts=PTS-STARTPTS[v{i}]")
+                parts.append(
+                    f"[{i}:v]trim={f['start']}:{f['end']},setpts=PTS-STARTPTS[v{i}]"
+                )
             else:
-                v_parts.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}]")
+                parts.append(
+                    f"[{i}:v]setpts=PTS-STARTPTS[v{i}]"
+                )
 
-        filter_parts.extend(v_parts)
+        v_inputs = "".join([f"[v{i}]" for i in range(len(files))])
+        a_inputs = "".join([f"[a{i}]" for i in range(len(files))])
 
-        v_concat_inputs = "".join([f"[v{i}]" for i in range(len(files))])
-
-        filter_parts.append(
-            f"{v_concat_inputs}{concat_inputs}concat=n={len(files)}:v=1:a=1[outv][outa]"
+        parts.append(
+            f"{v_inputs}{a_inputs}concat=n={len(files)}:v=1:a=1[outv][outa]"
         )
     else:
-        filter_parts.append(
-            f"{concat_inputs}concat=n={len(files)}:v=0:a=1[out]"
+        a_inputs = "".join([f"[a{i}]" for i in range(len(files))])
+        parts.append(
+            f"{a_inputs}concat=n={len(files)}:v=0:a=1[out]"
         )
 
-    return ";".join(filter_parts)
+    return ";".join(parts)
 
 
 def merge(files, output):
@@ -89,7 +94,6 @@ def merge(files, output):
 
     cmd = ["ffmpeg"]
 
-    # inputs
     for f in files:
         cmd.extend(["-i", f["path"]])
 
@@ -118,14 +122,10 @@ def merge(files, output):
     print(f"✅ Output created: {output}")
 
 
+# ----------------------------
+# CLI ARG PARSER (existing)
+# ----------------------------
 def parse_args(args):
-    """
-    Pattern:
-    file [start end] file [start end] ... output
-    """
-    if len(args) < 3:
-        raise ValueError("Not enough arguments")
-
     output = args[-1]
     tokens = args[:-1]
 
@@ -140,37 +140,85 @@ def parse_args(args):
                 start = float(tokens[i + 1])
                 end = float(tokens[i + 2])
 
-                files.append({
-                    "path": path,
-                    "start": start,
-                    "end": end
-                })
+                files.append({"path": path, "start": start, "end": end})
                 i += 3
                 continue
             except:
                 pass
 
-        # no trim
-        files.append({
-            "path": path,
-            "start": None,
-            "end": None
-        })
+        files.append({"path": path, "start": None, "end": None})
         i += 1
 
     return files, output
 
 
+# ----------------------------
+# CSV PARSER (new)
+# ----------------------------
+def parse_csv(csv_path):
+    files = []
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+
+        for row_num, row in enumerate(reader, start=1):
+            if len(row) == 0:
+                continue
+
+            if len(row) == 1:
+                # only file path
+                files.append({
+                    "path": row[0].strip(),
+                    "start": None,
+                    "end": None
+                })
+
+            elif len(row) == 3:
+                try:
+                    files.append({
+                        "path": row[0].strip(),
+                        "start": float(row[1]),
+                        "end": float(row[2])
+                    })
+                except:
+                    raise ValueError(f"❌ Invalid times in CSV at line {row_num}")
+
+            else:
+                raise ValueError(
+                    f"❌ Invalid CSV format at line {row_num}. Use: path OR path,start,end"
+                )
+
+    return files
+
+
+# ----------------------------
+# ENTRY POINT
+# ----------------------------
 if __name__ == "__main__":
     try:
-        files, output = parse_args(sys.argv[1:])
+        args = sys.argv[1:]
+
+        # CSV mode
+        if "--csv" in args:
+            idx = args.index("--csv")
+            csv_path = args[idx + 1]
+            output = args[idx + 2]
+
+            files = parse_csv(csv_path)
+
+        else:
+            # CLI mode
+            files, output = parse_args(args)
+
         merge(files, output)
 
     except Exception as e:
         print(f"\n❌ Error: {e}\n")
-        print("Usage:")
+        print("Usage:\n")
+        print("CLI mode:")
         print("python merge_media.py file1 [s1 e1] file2 [s2 e2] ... output\n")
-        print("Examples:")
-        print("python merge_media.py a.mp3 0 10 b.mp3 5 20 c.mp3 out.mp3")
-        print("python merge_media.py a.mp4 b.mp4 c.mp4 out.mp4\n")
+        print("CSV mode:")
+        print("python merge_media.py --csv input.csv output\n")
+        print("CSV format:")
+        print("path,start,end  OR  path\n")
         sys.exit(1)
