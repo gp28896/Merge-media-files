@@ -2,6 +2,10 @@ import subprocess
 import sys
 import os
 import csv
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor
+
 """
 -> A general-purpose concat CLI.
     -> variable number of inputs
@@ -16,14 +20,28 @@ import csv
 
 Sample usage:
 
+-> CLI input mode:
 python merge_media.py \
 a.mp3 0 27.4 \
 b.mp3 \
 c.mp3 5 15 \
 output.mp3
 
-
+-> csv input mode:
 python merge_media.py --csv C:/path/input.csv output.mp3
+-> SAMPLE CSV:
+<media_file_1_absolute_path>, <start_time_1>, <end_time_1> 
+<media_file_2_absolute_path>, <start_time_2>, <end_time_2> 
+...
+
+-> JSON input mode:
+python merge_media.py --json input.json output.mp3
+-> SAMPLE JSON:
+[
+  { "path": "C:/a.mp3", "start": 0, "end": 10 },
+  { "path": "C:/b.mp3" },
+  { "path": "C:/c.mp3", "start": 5, "end": 20 }
+]
 
 
 """
@@ -42,47 +60,86 @@ def validate_inputs(files):
     return exts[0]
 
 
-def build_filter(files, is_video):
-    parts = []
+# ----------------------------
+# DURATION (for progress bar)
+# ----------------------------
+def get_duration(file):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return float(result.stdout.strip())
 
-    # AUDIO filters
-    for i, f in enumerate(files):
-        if f["start"] is not None:
-            parts.append(
-                f"[{i}:a]atrim={f['start']}:{f['end']},asetpts=PTS-STARTPTS[a{i}]"
-            )
-        else:
-            parts.append(
-                f"[{i}:a]aresample=async=1:first_pts=0[a{i}]"
+
+# ----------------------------
+# PROGRESS BAR
+# ----------------------------
+def run_with_progress(cmd, total_duration):
+    process = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        text=True,
+        bufsize=1
+    )
+
+    time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+    while True:
+        line = process.stderr.readline()
+        if not line:
+            break
+
+        match = time_pattern.search(line)
+        if match:
+            h, m, s = match.groups()
+            current = int(h) * 3600 + int(m) * 60 + float(s)
+            percent = min(current / total_duration, 1.0)
+
+            bar = int(percent * 30)
+            print(
+                f"\r[{'#'*bar}{'.'*(30-bar)}] {percent*100:.1f}%",
+                end=""
             )
 
-    # VIDEO filters (if needed)
+    process.wait()
+    print()
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, cmd)
+
+
+# ----------------------------
+# PARALLEL PREPROCESS
+# ----------------------------
+def preprocess_file(i, f, is_video):
+    """Normalize file (trim + reset timestamps) into temp file"""
+    tmp = f"temp_{i}{get_ext(f['path'])}"
+
+    cmd = ["ffmpeg", "-y", "-i", f["path"]]
+
+    if f["start"] is not None:
+        cmd.extend(["-ss", str(f["start"]), "-to", str(f["end"])])
+
     if is_video:
-        for i, f in enumerate(files):
-            if f["start"] is not None:
-                parts.append(
-                    f"[{i}:v]trim={f['start']}:{f['end']},setpts=PTS-STARTPTS[v{i}]"
-                )
-            else:
-                parts.append(
-                    f"[{i}:v]setpts=PTS-STARTPTS[v{i}]"
-                )
-
-        v_inputs = "".join([f"[v{i}]" for i in range(len(files))])
-        a_inputs = "".join([f"[a{i}]" for i in range(len(files))])
-
-        parts.append(
-            f"{v_inputs}{a_inputs}concat=n={len(files)}:v=1:a=1[outv][outa]"
-        )
+        cmd.extend(["-c:v", "libx264", "-c:a", "aac"])
     else:
-        a_inputs = "".join([f"[a{i}]" for i in range(len(files))])
-        parts.append(
-            f"{a_inputs}concat=n={len(files)}:v=0:a=1[out]"
-        )
+        cmd.extend(["-acodec", "libmp3lame", "-ab", "192k"])
 
-    return ";".join(parts)
+    cmd.append(tmp)
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    return tmp
 
 
+# ----------------------------
+# MERGE
+# ----------------------------
 def merge(files, output):
     files = [{"path": norm(f["path"]), "start": f["start"], "end": f["end"]} for f in files]
     output = norm(output)
@@ -90,40 +147,90 @@ def merge(files, output):
     ext = validate_inputs(files)
     is_video = ext in [".mp4", ".mkv", ".mov", ".avi"]
 
-    filter_complex = build_filter(files, is_video)
+    print("⚡ Preprocessing files in parallel...")
 
+    with ThreadPoolExecutor() as executor:
+        temp_files = list(executor.map(
+            lambda args: preprocess_file(*args),
+            [(i, f, is_video) for i, f in enumerate(files)]
+        ))
+
+    # build concat filter (simple now)
+    inputs = []
     cmd = ["ffmpeg"]
 
-    for f in files:
-        cmd.extend(["-i", f["path"]])
-
-    cmd.extend(["-filter_complex", filter_complex])
+    for f in temp_files:
+        cmd.extend(["-i", f])
 
     if is_video:
+        n = len(temp_files)
         cmd.extend([
+            "-filter_complex",
+            f"{''.join([f'[{i}:v][{i}:a]' for i in range(n)])}"
+            f"concat=n={n}:v=1:a=1[outv][outa]",
             "-map", "[outv]",
             "-map", "[outa]",
             "-c:v", "libx264",
-            "-c:a", "aac"
+            "-c:a", "aac",
+            output
         ])
     else:
+        n = len(temp_files)
         cmd.extend([
+            "-filter_complex",
+            f"{''.join([f'[{i}:a]' for i in range(n)])}"
+            f"concat=n={n}:v=0:a=1[out]",
             "-map", "[out]",
             "-acodec", "libmp3lame",
-            "-ab", "192k"
+            "-ab", "192k",
+            output
         ])
 
-    cmd.append(output)
+    total_duration = sum(get_duration(f) for f in temp_files)
 
-    print("\nRunning:")
-    print(" ".join(cmd), "\n")
+    print("🎬 Merging with progress:\n")
+    run_with_progress(cmd, total_duration)
 
-    subprocess.run(cmd, check=True)
-    print(f"✅ Output created: {output}")
+    print(f"\n✅ Output created: {output}")
+
+    # cleanup
+    for f in temp_files:
+        os.remove(f)
 
 
 # ----------------------------
-# CLI ARG PARSER (existing)
+# CSV / JSON PARSERS
+# ----------------------------
+def parse_csv(path):
+    files = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) == 1:
+                files.append({"path": row[0], "start": None, "end": None})
+            elif len(row) == 3:
+                files.append({"path": row[0], "start": float(row[1]), "end": float(row[2])})
+            else:
+                raise ValueError("Invalid CSV format")
+    return files
+
+
+def parse_json(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    files = []
+    for item in data:
+        files.append({
+            "path": item["path"],
+            "start": item.get("start"),
+            "end": item.get("end")
+        })
+    return files
+
+
+# ----------------------------
+# CLI PARSER
 # ----------------------------
 def parse_args(args):
     output = args[-1]
@@ -137,9 +244,8 @@ def parse_args(args):
 
         if i + 2 < len(tokens):
             try:
-                start = float(tokens[i + 1])
-                end = float(tokens[i + 2])
-
+                start = float(tokens[i+1])
+                end = float(tokens[i+2])
                 files.append({"path": path, "start": start, "end": end})
                 i += 3
                 continue
@@ -153,72 +259,31 @@ def parse_args(args):
 
 
 # ----------------------------
-# CSV PARSER (new)
-# ----------------------------
-def parse_csv(csv_path):
-    files = []
-
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-
-        for row_num, row in enumerate(reader, start=1):
-            if len(row) == 0:
-                continue
-
-            if len(row) == 1:
-                # only file path
-                files.append({
-                    "path": row[0].strip(),
-                    "start": None,
-                    "end": None
-                })
-
-            elif len(row) == 3:
-                try:
-                    files.append({
-                        "path": row[0].strip(),
-                        "start": float(row[1]),
-                        "end": float(row[2])
-                    })
-                except:
-                    raise ValueError(f"❌ Invalid times in CSV at line {row_num}")
-
-            else:
-                raise ValueError(
-                    f"❌ Invalid CSV format at line {row_num}. Use: path OR path,start,end"
-                )
-
-    return files
-
-
-# ----------------------------
-# ENTRY POINT
+# ENTRY
 # ----------------------------
 if __name__ == "__main__":
     try:
         args = sys.argv[1:]
 
-        # CSV mode
         if "--csv" in args:
             idx = args.index("--csv")
-            csv_path = args[idx + 1]
-            output = args[idx + 2]
+            files = parse_csv(args[idx+1])
+            output = args[idx+2]
 
-            files = parse_csv(csv_path)
+        elif "--json" in args:
+            idx = args.index("--json")
+            files = parse_json(args[idx+1])
+            output = args[idx+2]
 
         else:
-            # CLI mode
             files, output = parse_args(args)
 
         merge(files, output)
 
     except Exception as e:
-        print(f"\n❌ Error: {e}\n")
-        print("Usage:\n")
-        print("CLI mode:")
-        print("python merge_media.py file1 [s1 e1] file2 [s2 e2] ... output\n")
-        print("CSV mode:")
-        print("python merge_media.py --csv input.csv output\n")
-        print("CSV format:")
-        print("path,start,end  OR  path\n")
+        print(f"\n❌ Error: {e}")
+        print("\nUsage:")
+        print("CLI: python merge_media.py f1 [s1 e1] f2 ... out")
+        print("CSV: python merge_media.py --csv input.csv out")
+        print("JSON: python merge_media.py --json input.json out")
         sys.exit(1)
